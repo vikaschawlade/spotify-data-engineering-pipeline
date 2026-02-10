@@ -1,0 +1,11 @@
+track_id,track_name,album_id,duration_ms,track_popularity
+T1,God's Plan,AL1,198000,96
+T2,In My Feelings,AL1,210000,94
+T3,Way 2 Sexy,AL2,257000,91
+T4,Anti-Hero,AL3,201000,97
+T5,Lavender Haze,AL3,202000,92
+T6,Blinding Lights,AL5,200000,99
+T7,Save Your Tears,AL5,215000,95
+T8,Titi Me Pregunto,AL6,243000,98
+T9,Shivers,AL7,238000,93
+T10,Perfect,AL7,263000,94
