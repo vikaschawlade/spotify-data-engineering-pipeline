@@ -1,0 +1,246 @@
+import sys
+import logging
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+from awsglue.context import GlueContext
+from awsglue.utils import getResolvedOptions
+from awsglue.job import Job
+
+
+# -----------------------------
+# Logging setup
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------
+# Schemas
+# -----------------------------
+def get_schemas():
+    artists_schema = StructType([
+        StructField("artist_id", StringType(), True),
+        StructField("artist_name", StringType(), True),
+        StructField("artist_popularity", IntegerType(), True)
+    ])
+
+    albums_schema = StructType([
+        StructField("album_id", StringType(), True),
+        StructField("album_name", StringType(), True),
+        StructField("artist_id", StringType(), True),
+        StructField("release_date", StringType(), True)
+    ])
+
+    tracks_schema = StructType([
+        StructField("track_id", StringType(), True),
+        StructField("track_name", StringType(), True),
+        StructField("album_id", StringType(), True),
+        StructField("duration_ms", IntegerType(), True),
+        StructField("track_popularity", IntegerType(), True)
+    ])
+
+    return artists_schema, albums_schema, tracks_schema
+
+
+# -----------------------------
+# Read data
+# -----------------------------
+def read_csv(spark, path, schema, name):
+    logger.info(f"Reading {name} data from {path}")
+    return (
+        spark.read
+        .option("header", True)
+        .schema(schema)
+        .csv(path)
+    )
+
+
+# -----------------------------
+# Build base dataframe
+# -----------------------------
+def build_spotify_base(tracks_df, albums_df, artists_df):
+    logger.info("Building base Spotify analytics dataframe")
+
+    albums_df = albums_df.withColumn(
+        "release_year",
+        F.year(F.to_date("release_date"))
+    )
+
+    df = (
+        tracks_df
+        .join(albums_df, "album_id")
+        .join(artists_df, "artist_id")
+        .select(
+            "track_id",
+            "track_name",
+            "album_name",
+            "artist_name",
+            "release_year",
+            "duration_ms",
+            "track_popularity",
+            "artist_popularity"
+        )
+        .withColumn(
+            "track_duration_minutes",
+            F.round(F.col("duration_ms") / 60000, 2)
+        )
+    )
+
+    return df
+
+
+# -----------------------------
+# Write dataframe
+# -----------------------------
+def write_df(df, path, fmt="parquet", partition_col=None, coalesce_one=False):
+    logger.info(f"Writing data to {path} as {fmt}")
+
+    writer = df.write.mode("overwrite")
+
+    if partition_col:
+        writer = writer.partitionBy(partition_col)
+
+    if coalesce_one:
+        df = df.coalesce(1)
+        writer = df.write.mode("overwrite")
+
+    if fmt == "parquet":
+        writer.parquet(path)
+    elif fmt == "csv":
+        writer.option("header", True).csv(path)
+    else:
+        raise ValueError(f"Unsupported format: {fmt}")
+
+
+# -----------------------------
+# Analytics
+# -----------------------------
+def top_tracks(df):
+    logger.info("Calculating top 10 tracks")
+
+    return (
+        df.groupBy("track_name")
+        .agg(F.max("track_popularity").alias("popularity"))
+        .orderBy(F.desc("popularity"))
+        .limit(10)
+    )
+
+
+def top_artists(df):
+    logger.info("Calculating top 10 artists")
+
+    return (
+        df.groupBy("artist_name")
+        .agg(F.max("artist_popularity").alias("popularity"))
+        .orderBy(F.desc("popularity"))
+        .limit(10)
+    )
+
+
+def top_album_by_year(df):
+    logger.info("Calculating top album per year")
+
+    album_year_df = (
+        df.groupBy("release_year", "album_name")
+        .agg(F.count("track_id").alias("total_tracks"))
+    )
+
+    window_spec = Window.partitionBy("release_year") \
+        .orderBy(F.desc("total_tracks"))
+
+    return (
+        album_year_df
+        .withColumn("rank", F.row_number().over(window_spec))
+        .filter(F.col("rank") == 1)
+        .drop("rank")
+    )
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    try:
+        args = getResolvedOptions(sys.argv, ["JOB_NAME"])
+
+        sc = SparkContext()
+        glue_context = GlueContext(sc)
+        spark = glue_context.spark_session
+
+        job = Job(glue_context)
+        job.init(args["JOB_NAME"], args)
+
+        spark.conf.set("spark.sql.shuffle.partitions", "200")
+
+        RAW_BUCKET = "s3://your-spotify-raw-bucket"
+        PROCESSED_BUCKET = "s3://your-spotify-processed-bucket"
+
+        artists_path = f"{RAW_BUCKET}/artists/"
+        albums_path = f"{RAW_BUCKET}/albums/"
+        tracks_path = f"{RAW_BUCKET}/tracks/"
+        output_path = f"{PROCESSED_BUCKET}/processed/"
+
+        logger.info("Glue job started")
+
+        artists_schema, albums_schema, tracks_schema = get_schemas()
+
+        artists_df = read_csv(spark, artists_path, artists_schema, "artists")
+        albums_df = read_csv(spark, albums_path, albums_schema, "albums")
+        tracks_df = read_csv(spark, tracks_path, tracks_schema, "tracks")
+
+        spotify_df = build_spotify_base(tracks_df, albums_df, artists_df)
+        spotify_df.cache()
+
+        write_df(
+            spotify_df,
+            f"{output_path}/spotify_analytics_base_parquet",
+            fmt="parquet",
+            partition_col="release_year"
+        )
+
+        write_df(
+            spotify_df,
+            f"{output_path}/spotify_analytics_base_csv",
+            fmt="csv",
+            coalesce_one=True
+        )
+
+        write_df(
+            top_tracks(spotify_df),
+            f"{output_path}/top_10_tracks",
+            fmt="csv",
+            coalesce_one=True
+        )
+
+        write_df(
+            top_artists(spotify_df),
+            f"{output_path}/top_10_artists",
+            fmt="csv",
+            coalesce_one=True
+        )
+
+        write_df(
+            top_album_by_year(spotify_df),
+            f"{output_path}/top_album_by_year",
+            fmt="csv",
+            coalesce_one=True
+        )
+
+        job.commit()
+        logger.info("Glue job completed successfully")
+
+    except Exception as e:
+        logger.error("Glue job failed", exc_info=True)
+        raise e
+
+
+# -----------------------------
+# Entry point
+# -----------------------------
+if __name__ == "__main__":
+    main()
